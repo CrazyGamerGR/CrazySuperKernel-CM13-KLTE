@@ -19,6 +19,7 @@
 #include <linux/io.h>
 #include <linux/ftrace.h>
 #include <linux/msm_adreno_devfreq.h>
+#include <linux/powersuspend.h>
 #include <mach/scm.h>
 #include "governor.h"
 
@@ -45,6 +46,9 @@ static DEFINE_SPINLOCK(tz_lock);
 
 #define DEVFREQ_ADRENO_TZ	"msm-adreno-tz"
 #define TAG "msm_adreno_tz: "
+
+/* Boolean to detect if pm has entered suspend mode */
+static bool suspended = false;
 
 static unsigned int tz_target = TARGET;
 static unsigned int tz_cap = CAP;
@@ -84,6 +88,10 @@ static void _update_cutoff(struct devfreq_msm_adreno_tz_data *priv,
 	}
 }
 
+#ifdef CONFIG_ADRENO_IDLER
+extern int adreno_idler(struct devfreq_dev_status stats, struct devfreq *devfreq,
+		 unsigned long *freq);
+#endif
 static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 				u32 *flag)
 {
@@ -106,8 +114,31 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 		return result;
 	}
 
+	/* Prevent overflow */
+	if (stats.busy_time >= (1 << 24) || stats.total_time >= (1 << 24)) {
+		stats.busy_time >>= 7;
+		stats.total_time >>= 7;
+	}
+
 	*freq = stats.current_frequency;
 	*flag = 0;
+
+	/*
+	 * Force to use & record as min freq when system has
+	 * entered pm-suspend or screen-off state.
+	 */
+	if (suspended || power_suspended) {
+		*freq = devfreq->profile->freq_table[devfreq->profile->max_state - 1];
+		return 0;
+	}
+
+#ifdef CONFIG_ADRENO_IDLER
+	if (adreno_idler(stats, devfreq, freq)) {
+		/* adreno_idler has asked to bail out now */
+		return 0;
+	}
+#endif
+
 	priv->bin.total_time += stats.total_time;
 	priv->bin.busy_time += stats.busy_time;
 	if (priv->bus.num) {
@@ -179,13 +210,13 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 		 * Normalize by gpu_time unless it is a small fraction of
 		 * the total time interval.
 		 */
-		norm_cycles = (100 * norm_cycles) / TARGET;
+		norm_cycles = (100 * norm_cycles) / tz_target;
 		act_level = priv->bus.index[level] + b.mod;
 		act_level = (act_level < 0) ? 0 : act_level;
 		act_level = (act_level >= priv->bus.num) ?
 			(priv->bus.num - 1) : act_level;
 		if (norm_cycles > priv->bus.up[act_level] &&
-			gpu_percent > CAP)
+			gpu_percent > tz_cap)
 			*flag = DEVFREQ_FLAG_FAST_HINT;
 		else if (norm_cycles < priv->bus.down[act_level] && level)
 			*flag = DEVFREQ_FLAG_SLOW_HINT;
@@ -287,6 +318,8 @@ static int tz_resume(struct devfreq *devfreq)
 	struct devfreq_dev_profile *profile = devfreq->profile;
 	unsigned long freq;
 
+	suspended = false;
+
 	freq = profile->initial_freq;
 
 	return profile->target(devfreq->dev.parent, &freq, 0);
@@ -295,6 +328,8 @@ static int tz_resume(struct devfreq *devfreq)
 static int tz_suspend(struct devfreq *devfreq)
 {
 	struct devfreq_msm_adreno_tz_data *priv = devfreq->data;
+
+	suspended = true;
 
 	__secure_tz_entry2(TZ_RESET_ID, 0, 0);
 
