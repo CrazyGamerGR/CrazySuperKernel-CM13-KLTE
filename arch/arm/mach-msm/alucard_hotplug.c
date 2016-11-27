@@ -15,6 +15,7 @@
  */
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
+#include <asm/cputime.h>
 #include <linux/jiffies.h>
 #include <linux/kernel_stat.h>
 #include <linux/tick.h>
@@ -155,7 +156,7 @@ static void stop_rq_work(void)
 	return;
 }
 
-static int init_rq_avg(void)
+static int __init init_rq_avg(void)
 {
 	rq_data = kzalloc(sizeof(struct runqueue_data), GFP_KERNEL);
 	if (rq_data == NULL) {
@@ -254,6 +255,7 @@ static void __ref hotplug_work_fn(struct work_struct *work)
 #endif
 		unsigned int cur_load = 0;
 		unsigned int cur_freq = 0;
+		bool check_up = false, check_down = false;
 
 #ifdef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
 		cur_load = cpufreq_quick_get_util(cpu);
@@ -271,16 +273,30 @@ static void __ref hotplug_work_fn(struct work_struct *work)
 					pcpu_info->prev_cpu_idle);
 		pcpu_info->prev_cpu_idle = cur_idle_time;
 
-		/* if wall_time < idle_time or wall_time == 0, evaluate cpu load next time */
-		if (unlikely(!wall_time || wall_time < idle_time))
+		/* if wall_time < idle_time, evaluate cpu load next time */
+		if (wall_time < idle_time)
 			continue;
-
-		cur_load = 100 * (wall_time - idle_time) / wall_time;
+		/*
+		 * if wall_time is equal to idle_time,
+		 * cpu_load is equal to 0
+		 */
+		cur_load = wall_time > idle_time ? (100 *
+			(wall_time - idle_time)) / wall_time : 0;
 #endif
 
 		/* get the cpu current frequency */
 		/* cur_freq = acpuclk_get_rate(cpu); */
 		cur_freq = cpufreq_quick_get(cpu);
+
+		if (pcpu_info->cur_up_rate > pcpu_info->up_rate)
+			pcpu_info->cur_up_rate = 1;
+
+		if (pcpu_info->cur_down_rate > pcpu_info->down_rate)
+			pcpu_info->cur_down_rate = 1;
+
+		check_up = (pcpu_info->cur_up_rate % pcpu_info->up_rate == 0);
+		check_down = (pcpu_info->cur_down_rate %
+					pcpu_info->down_rate == 0);
 
 		if (cpu > 0
 			&& ((online_cpus - offline_cpu) > upmaxcoreslimit)) {
@@ -309,8 +325,8 @@ static void __ref hotplug_work_fn(struct work_struct *work)
 		    && cur_load >= pcpu_info->up_load
 			&& cur_freq >= pcpu_info->up_freq
 			&& rq_avg > pcpu_info->up_rq) {
-				if (pcpu_info->cur_up_rate %
-						pcpu_info->up_rate == 0) {
+				++pcpu_info->cur_up_rate;
+				if (check_up) {
 #if 0
 					pr_info("CPU[%u], UPCPU[%u], \
 						cur_freq[%u], cur_load[%u], \
@@ -345,11 +361,6 @@ static void __ref hotplug_work_fn(struct work_struct *work)
 						pcpu_info->cur_down_rate = 1;
 						++offline_cpu;
 						cpu_down(cpu);
-				} else {
-						if (pcpu_info->cur_down_rate < pcpu_info->down_rate)
-							++pcpu_info->cur_down_rate;
-						else
-							pcpu_info->cur_down_rate = 1;
 					}
 		} else {
 			pcpu_info->cur_up_rate = 1;
@@ -359,7 +370,6 @@ static void __ref hotplug_work_fn(struct work_struct *work)
 
 	if (force_up == true)
 		hotplug_tuners_ins.force_cpu_up = false;
-		
 	queue_delayed_work_on(0, system_wq,
 				&alucard_hotplug_work,
 				msecs_to_jiffies(
@@ -380,6 +390,7 @@ static void __alucard_hotplug_suspend(void)
 			mutex_unlock(&hotplug_tuners_ins.alu_hotplug_mutex);
 			pr_info("Alucard HotPlug suspended.\n");
 	}
+	stop_rq_work();
 }
 
 #ifdef CONFIG_POWERSUSPEND
@@ -397,6 +408,7 @@ static void __ref __alucard_hotplug_resume(void)
 			mutex_unlock(&hotplug_tuners_ins.alu_hotplug_mutex);
 			pr_info("Alucard HotPlug Resumed.\n");
 	}
+	start_rq_work();
 }
 
 #ifdef CONFIG_POWERSUSPEND
@@ -437,32 +449,6 @@ static int fb_notifier_callback(struct notifier_block *self,
 }
 #endif
 
-#ifndef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
-static int alucard_hotplug_callback(struct notifier_block *nb,
-			unsigned long action, void *data)
-{
-	struct hotplug_cpuinfo *pcpu_info;
-	unsigned int cpu = (int)data;
-
-	switch (action & (~CPU_TASKS_FROZEN)) {
-	case CPU_ONLINE:
-		pcpu_info = &per_cpu(od_hotplug_cpuinfo, cpu);
-		pcpu_info->prev_cpu_wall = ktime_to_us(ktime_get());
-		pcpu_info->prev_cpu_idle = get_cpu_idle_time(cpu,
-				&pcpu_info->prev_cpu_wall,
-				hotplug_tuners_ins.hp_io_is_busy);
-		break;
-	}
-
-	return NOTIFY_OK;
-}
-
-static struct notifier_block alucard_hotplug_nb =
-{
-   .notifier_call = alucard_hotplug_callback,
-};
-#endif
-
 static int hotplug_start(void)
 {
 	unsigned int cpu;
@@ -476,28 +462,18 @@ static int hotplug_start(void)
 	hotplug_tuners_ins.suspended = false;
 	hotplug_tuners_ins.force_cpu_up = false;
 
-#ifndef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
-	get_online_cpus();
-	register_hotcpu_notifier(&alucard_hotplug_nb);
-#endif
 	for_each_possible_cpu(cpu) {
 		struct hotplug_cpuinfo *pcpu_info =
 				&per_cpu(od_hotplug_cpuinfo, cpu);
 
 #ifndef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
-		if (cpu_online(cpu)) {
-			pcpu_info->prev_cpu_wall = ktime_to_us(ktime_get());
-			pcpu_info->prev_cpu_idle = get_cpu_idle_time(cpu,
-					&pcpu_info->prev_cpu_wall,
-					hotplug_tuners_ins.hp_io_is_busy);
-		}
+		pcpu_info->prev_cpu_idle = get_cpu_idle_time(cpu,
+				&pcpu_info->prev_cpu_wall,
+				hotplug_tuners_ins.hp_io_is_busy);
 #endif
 		pcpu_info->cur_up_rate = 1;
 		pcpu_info->cur_down_rate = 1;
 	}
-#ifndef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
-	put_online_cpus();
-#endif
 
 	start_rq_work();
 
@@ -528,11 +504,6 @@ static void hotplug_stop(void)
 #else
 	fb_unregister_client(&notif);
 	notif.notifier_call = NULL;
-#endif
-#ifndef CONFIG_ALUCARD_HOTPLUG_USE_CPU_UTIL
-	get_online_cpus();
-	unregister_hotcpu_notifier(&alucard_hotplug_nb);
-	put_online_cpus();
 #endif
 	stop_rq_work();
 	exit_rq_avg();
