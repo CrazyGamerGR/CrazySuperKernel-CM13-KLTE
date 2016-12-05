@@ -14,12 +14,8 @@ struct cpufreq_limit_handle;
 
 #ifdef CONFIG_CPU_FREQ_LIMIT
 
-#if defined(CONFIG_ARCH_MSM8974PRO)
-#define MAX_FREQ_LIMIT	2457600
-#else
-#define MAX_FREQ_LIMIT	2265600
-#endif
-#define MIN_FREQ_LIMIT	300000
+#define MAX_FREQ_LIMIT	2841600
+#define MIN_FREQ_LIMIT	268800
 
 struct cpufreq_limit_handle *cpufreq_limit_get(unsigned long min_freq,
 		unsigned long max_freq, char *label);
